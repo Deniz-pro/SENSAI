@@ -1,0 +1,8 @@
+requests
+python-dotenv
+pdfminer.six
+beautifulsoup4
+numpy
+fastapi
+uvicorn
+fpdf2

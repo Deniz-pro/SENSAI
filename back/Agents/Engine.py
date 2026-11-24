@@ -1,0 +1,151 @@
+"""
+The single entry point the chat uses to get an answer.
+
+    generate_reply(session, context, user_input) -> Reply | None
+
+Tools are part of every normal turn; the user never has to ask for them.
+
+  * no tools available / disabled / small talk -> one plain streaming call,
+    exactly as before the agent existed
+  * otherwise -> the SAME first call, with the tools offered. If the model
+    just answers, that is the whole turn (one call, streamed, no overhead).
+    Only when the model asks for a tool does the ReAct loop continue
+  * a model that cannot do tool calling is detected once, remembered, and
+    served without tools: nothing breaks, the user sees one dimmed note
+"""
+
+from dataclasses import replace
+from datetime import date, timedelta
+from Agents.ReAct import ReActAgent, describe_day, ollama_llm
+from Agents.Router import asks_for_search, leave_type_in, refers_to_attachments, should_offer_tools, wants_leave_without_dates
+from Memories import Compression
+from rag.Attachments import has_attachments
+
+PREFIX = "Assistant: "
+CHARS_PER_TOKEN = 4  # same estimate as the compression module
+
+# Models Ollama refused tools for. Process-wide: it is a property of the model.
+_NO_TOOLS: set[str] = set()
+
+
+def _is_tools_refusal(message: str) -> bool:
+    return "support tools" in message.lower()
+
+
+def _activity_reporter(out):
+    """[A1] Every step of the loop (thought, action, observation...) goes to the output,
+    so the user sees HOW the answer was reached: dimmed lines in the terminal, the
+    "Reasoning" panel in the web UI."""
+    def report(kind: str, text: str) -> None:
+        if text.strip():
+            out.trace(kind, text)
+    return report
+
+
+def with_date(context: list[dict]) -> list[dict]:
+    """The context with today's date in its system message. With tools, the tool guidance
+    carries it; without (small talk, "on est quel jour ?", a model without tools), this does.
+    It is added for the call only: the cache fingerprint must not change every day."""
+    today = date.today()
+    line = f"\n\nToday is {describe_day(today)}; tomorrow is {describe_day(today + timedelta(days=1))}."
+    context = [dict(m) for m in context]
+    if context and context[0].get("role") == "system":
+        context[0]["content"] += line
+    else:
+        context.insert(0, {"role": "system", "content": line.strip()})
+    return context
+
+
+def tools_available(session, user_input: str) -> bool:
+    return bool(
+        session.tools is not None
+        and session.tools.names()
+        and session.tools_enabled
+        and session.model not in _NO_TOOLS
+        and should_offer_tools(user_input)
+        and not (refers_to_attachments(user_input) and has_attachments(session.conversation_id))
+    )
+
+
+def leave_form_reply(session, user_input: str):
+    """[X4] A leave request with no date: the form, prefilled with the type the message names,
+    without calling the model. The user completes it; submitting it files the request."""
+    from Agents.Leave import leave_form
+    from Chatbot import Reply  # lazy: Chatbot imports this module
+    form = leave_form(session, leave_type=leave_type_in(user_input))
+    form.conversation_id = session.conversation_id
+    session.pending_action = form
+    session.out.confirmation(form.title, form.plan, form.as_dict())
+    text = form.render()
+    session.out.answer(text)
+    return Reply(text, used_tools=True)  # used_tools: the semantic cache never keeps it
+
+
+def generate_reply(session, context: list[dict], user_input: str):
+    """context: the system prompt + history + the current user message.
+    Streams the answer to session.out. Returns a Reply, or None if the call
+    failed (the error has been reported)."""
+    from Chatbot import Reply, call_ollama  # lazy: Chatbot imports this module
+
+    def plain() -> Reply | None:
+        return call_ollama(session.ollama_url, session.model, with_date(context),
+                           temperature=session.temperature, prefix=PREFIX,
+                           options=session.ollama_options(), out=session.out)
+
+    if not tools_available(session, user_input):
+        return plain()
+
+    if "file_leave_request" in session.tools.names() and wants_leave_without_dates(user_input):
+        return leave_form_reply(session, user_input)
+
+    last_text = {"value": ""}
+    base_llm = ollama_llm(session.ollama_url, session.model, echo=True, prefix=PREFIX,
+                          options=session.ollama_options(), out=session.out)
+
+    def llm(messages, tools, temperature):
+        if last_text["value"].strip():
+            # The loop calls the model again (a tool, an empty or repeated reply): what the
+            # previous call streamed is not the answer, the interface drops it.
+            session.out.retract()
+        reply = base_llm(messages, tools, temperature)
+        last_text["value"] = reply.content
+        if session.out.stopped():
+            return replace(reply, tool_calls=[])
+        return reply
+
+    if asks_for_search(user_input):
+        # The user EXPLICITLY asked for a search: say it to the model, for this turn only
+        # (the stored message stays the user's own words).
+        context = [dict(m) for m in context]
+        context[-1]["content"] += ("\n\n[The user asks you to search the web: call "
+                                  "search_internet now, then answer from the results.]")
+
+    agent = ReActAgent(
+        llm, session.tools, temperature=session.temperature,
+        on_event=_activity_reporter(session.out) if session.show_tool_activity else None,
+        context_char_budget=Compression.DEFAULT_BUDGET * CHARS_PER_TOKEN,
+    )
+    result = agent.run_messages(context)
+    if session.out.stopped():
+        return Reply(last_text["value"], result.prompt_tokens, result.completion_tokens, used_tools=bool(result.steps))
+
+    if result.status == "llm_error":
+        if not result.steps and _is_tools_refusal(result.answer):
+            _NO_TOOLS.add(session.model)
+            session.out.note(f"[{session.model} cannot use tools: answering without them]")
+            return plain()
+        session.out.error(result.answer)
+        return None
+
+    if result.pending is not None:
+        # [A3] The agent is suspended: the action waits for /confirm or /cancel.
+        result.pending.conversation_id = session.conversation_id
+        session.pending_action = result.pending
+        # [X4] A form (a question, an incomplete leave request) is shown as a card to fill in.
+        form = result.pending.as_dict() if hasattr(result.pending, "as_dict") else None
+        session.out.confirmation(result.pending.title, result.pending.plan, form)
+
+    if result.answer.strip() != last_text["value"].strip():
+        session.out.answer(result.answer)  # answer produced by a fallback, not streamed
+    return Reply(result.answer, result.prompt_tokens, result.completion_tokens,
+                 used_tools=bool(result.steps))

@@ -1,0 +1,318 @@
+"""Tests for rag.Retriever, the RAG step of the chat and /ingest."""
+
+import contextlib
+import io
+import logging
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+import numpy as np
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import Chatbot
+import Commands
+from Memories.Compression import estimate_tokens
+from rag import Retriever
+
+CHUNKS = [
+    {"source": "loi_conge_mariage_pacs.md", "page": None, "chunk_index": 0,
+     "text": "Le salarié a droit à 4 jours de congé pour son mariage."},
+    {"source": "loi_teletravail.md", "page": None, "chunk_index": 0,
+     "text": "Le télétravail est mis en place par accord collectif."},
+    {"source": "accord_nao_2026.pdf", "page": 4, "chunk_index": 3,
+     "text": "Augmentation générale de 2 % au 1er janvier."},
+]
+
+MATRIX = np.array([[0.9, 0.436], [0.75, 0.661], [0.3, 0.954]], dtype=np.float32)
+QUESTION_VECTOR = [1.0, 0.0]
+
+
+def _index(chunks=CHUNKS, matrix=MATRIX):
+    return mock.patch.object(Retriever, "load_chunks", return_value=(chunks, matrix))
+
+
+def _embedding(vector=QUESTION_VECTOR):
+    return mock.patch.object(Retriever, "embed_query", return_value=vector)
+
+
+def use_temporary_database(test):
+    """Point the database at a temporary file for this test: never at storage/sensai.db,
+    which is the user's real database."""
+    from Memories import Database
+    folder = tempfile.TemporaryDirectory()
+    test.addCleanup(folder.cleanup)
+    patch = mock.patch.object(Database, "DB_PATH", os.path.join(folder.name, "test.db"))
+    patch.start()
+    test.addCleanup(patch.stop)
+    Database.init_db()
+
+
+class RetrieveTests(unittest.TestCase):
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"RAG_MIN_SCORE": "", "RAG_TOP_K": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_relevant_chunks_come_best_first_with_their_score(self):
+        with _index(), _embedding():
+            found = Retriever.retrieve("congé mariage ?")
+        self.assertEqual([c["source"] for c in found],
+                         ["loi_conge_mariage_pacs.md", "loi_teletravail.md"])
+        self.assertAlmostEqual(found[0]["semantic"], 0.9, places=2)
+        self.assertGreater(found[0]["keyword"], 0)  # "congé" and "mariage" are in the chunk
+        self.assertAlmostEqual(found[0]["score"], 0.85 * found[0]["semantic"] + 0.15 * found[0]["keyword"], places=6)
+
+    def test_chunks_under_the_min_score_are_dropped(self):
+        with _index(), _embedding():
+            found = Retriever.retrieve("question")
+        self.assertNotIn("accord_nao_2026.pdf", [c["source"] for c in found])
+
+    def test_off_topic_question_gets_nothing(self):
+        with _index(), _embedding([0.0, -1.0]):
+            self.assertEqual(Retriever.retrieve("recette de la pizza ?"), [])
+
+    def test_top_k_and_min_score_come_from_env(self):
+        with _index(), _embedding(), \
+             mock.patch.dict(os.environ, {"RAG_TOP_K": "1", "RAG_MIN_SCORE": "0.1"}):
+            found = Retriever.retrieve("question")
+        self.assertEqual([c["source"] for c in found], ["loi_conge_mariage_pacs.md"])
+
+    def test_scores_are_cosine_even_for_unnormalized_vectors(self):
+        with _index(matrix=MATRIX * 7), _embedding([3.0, 0.0]):
+            found = Retriever.retrieve("question")
+        self.assertAlmostEqual(found[0]["semantic"], 0.9, places=2)
+
+    def test_empty_index_does_not_call_ollama(self):
+        empty = ([], np.empty((0, 0), dtype=np.float32))
+        with mock.patch.object(Retriever, "load_chunks", return_value=empty), \
+             mock.patch.object(Retriever, "other_embed_models", return_value=[]), _embedding() as embed:
+            self.assertEqual(Retriever.retrieve("question"), [])
+        embed.assert_not_called()
+
+    def test_ollama_failure_gives_no_chunk(self):
+        with _index(), _embedding(None):
+            self.assertEqual(Retriever.retrieve("question"), [])
+
+    def test_invalid_setting_warns_and_uses_the_default(self):
+        with _index(), _embedding(), mock.patch.dict(os.environ, {"RAG_MIN_SCORE": "0,7"}), \
+             self.assertLogs("rag.Retriever", logging.WARNING) as logs:
+            found = Retriever.retrieve("question")
+        self.assertIn("RAG_MIN_SCORE", logs.output[0])
+        self.assertEqual(len(found), 2)
+
+    def test_index_built_with_other_embeddings_gives_nothing(self):
+        with _index(), _embedding([1.0, 0.0, 0.0]), \
+             self.assertLogs("rag.Retriever", logging.WARNING) as logs:
+            self.assertEqual(Retriever.retrieve("question"), [])
+        self.assertIn("/ingest", logs.output[0])
+
+    def test_keywords_rerank_chunks_that_mean_almost_the_same(self):
+        chunks = [{"source": "a.md", "page": None, "chunk_index": 0, "text": "Les congés pour événements familiaux."},
+                  {"source": "b.md", "page": None, "chunk_index": 0, "text": "Le Pacs ouvre droit à quatre jours de congé."}]
+        matrix = np.array([[0.80, 0.6], [0.78, 0.626]], dtype=np.float32)
+        with _index(chunks, matrix), _embedding([1.0, 0.0]):
+            found = Retriever.retrieve("Combien de jours pour un Pacs ?")
+        semantic = {c["source"]: c["semantic"] for c in found}
+        self.assertGreater(semantic["a.md"], semantic["b.md"])  # a.md is closer by meaning only
+        self.assertEqual([c["source"] for c in found], ["b.md", "a.md"])  # "Pacs" and "jours" move b.md first
+
+    def test_the_threshold_drops_near_misses_on_the_final_score(self):
+        with _index(), _embedding(), mock.patch.dict(os.environ, {"RAG_MIN_SCORE": "0.7"}):
+            found = Retriever.retrieve("rien en commun")
+        self.assertEqual([c["source"] for c in found], ["loi_conge_mariage_pacs.md"])  # 0.85 * 0.75 < 0.7 for the 2nd
+
+    def test_the_scope_keeps_only_the_chosen_documents_or_types(self):
+        with _index(), _embedding(), mock.patch.dict(os.environ, {"RAG_MIN_SCORE": "-1"}):
+            by_name = Retriever.retrieve("question", scope={"sources": ["loi_teletravail.md"]})
+            by_type = Retriever.retrieve("question", scope={"types": ["pdf"]})
+            nothing = Retriever.retrieve("question", scope={"sources": ["absent.md"]})
+            both = Retriever.retrieve("question", scope={"sources": ["loi_teletravail.md"], "types": ["pdf"]})
+        self.assertEqual([c["source"] for c in by_name], ["loi_teletravail.md"])
+        self.assertEqual([c["source"] for c in by_type], ["accord_nao_2026.pdf"])
+        self.assertEqual(nothing, [])
+        self.assertEqual(sorted(c["source"] for c in both), ["accord_nao_2026.pdf", "loi_teletravail.md"])
+
+    def test_the_message_lists_its_sources_with_their_scores(self):
+        with _index(), _embedding():
+            message = Retriever.rag_message("congé mariage ?", 2000)
+        self.assertEqual([s["source"] for s in message["sources"]], ["loi_conge_mariage_pacs.md", "loi_teletravail.md"])
+        first = message["sources"][0]
+        self.assertEqual(set(first), {"source", "page", "score", "semantic", "keyword", "excerpt"})
+        self.assertEqual(first["excerpt"], "Le salarié a droit à 4 jours de congé pour son mariage.")
+
+    def test_an_index_left_by_another_model_is_reported_not_skipped_in_silence(self):
+        from rag import Store
+        with tempfile.TemporaryDirectory() as folder:
+            db = os.path.join(folder, "t.db")
+            Store.init_rag_db(db)
+            conn = Store.get_connection(db)
+            with conn:
+                conn.execute("INSERT INTO documents (folder, source, file_hash, embed_model) VALUES ('d', 'a.md', 'h', 'nomic-embed-text')")
+            conn.close()
+            with mock.patch.dict(os.environ, {"RAG_EMBED_MODEL": "bge-m3"}), _embedding() as embed, \
+                 self.assertLogs("rag.Retriever", logging.WARNING) as logs:
+                self.assertEqual(Retriever.retrieve("question", db_path=db), [])
+        embed.assert_not_called()
+        self.assertIn("indexed with nomic-embed-text, not bge-m3: run /ingest again", logs.output[0])
+
+    def test_zero_vector_is_ignored_without_warning(self):
+        matrix = np.vstack([np.zeros(2, dtype=np.float32), MATRIX[0]])
+        with _index(CHUNKS[:2], matrix), _embedding():
+            found = Retriever.retrieve("question")
+        self.assertEqual([c["source"] for c in found], ["loi_teletravail.md"])
+
+    def test_question_is_embedded_on_the_chat_ollama_server(self):
+        with _index(), _embedding() as embed:
+            Retriever.retrieve("question", ollama_url="http://other:11434")
+        embed.assert_called_once_with("question", "http://other:11434")
+
+
+class DocumentsMessageTests(unittest.TestCase):
+    def test_message_lists_sources_with_pages(self):
+        message = Retriever.documents_message(CHUNKS, 10_000)
+        self.assertEqual(message["role"], "system")
+        self.assertIn("[loi_conge_mariage_pacs.md]\nLe salarié", message["content"])
+        self.assertIn("[accord_nao_2026.pdf, p. 4]\n", message["content"])
+
+    def test_only_chunks_that_fit_are_added_best_first(self):
+        one_chunk = f"{Retriever.CONTEXT_HEADER}\n\n{Retriever.format_chunk(CHUNKS[0])}"
+        message = Retriever.documents_message(CHUNKS, estimate_tokens(one_chunk))
+        self.assertEqual(message["content"], one_chunk)
+
+    def test_message_never_exceeds_the_budget(self):
+        for max_tokens in range(0, 200):
+            message = Retriever.documents_message(CHUNKS, max_tokens)
+            if message:
+                self.assertLessEqual(estimate_tokens(message["content"]), max_tokens)
+
+    def test_nothing_fits_or_nothing_found_gives_none(self):
+        self.assertIsNone(Retriever.documents_message(CHUNKS, 5))
+        self.assertIsNone(Retriever.documents_message([], 10_000))
+
+    def test_no_room_for_a_chunk_skips_the_search(self):
+        header = estimate_tokens(Retriever.CONTEXT_HEADER)
+        with mock.patch.object(Retriever, "retrieve") as retrieve:
+            self.assertIsNone(Retriever.rag_message("question", 0))
+            self.assertIsNone(Retriever.rag_message("question", header))
+        retrieve.assert_not_called()
+
+
+class ChatTurnTests(unittest.TestCase):
+    def setUp(self):
+        use_temporary_database(self)
+        self.session = Commands.Session(
+            user_id="u", conversation_id=1, model="m", persona_id="p",
+            personas={"p": {"system_prompt": "Tu es RH."}},
+            ollama_url="http://x", search_motor="none", show_token_usage=False,
+            semantic_cache=False,
+        )
+        self.sent = []
+        patches = [
+            mock.patch.object(Chatbot, "build_context",
+                              return_value=[{"role": "system", "content": "Tu es RH."}]),
+            mock.patch.object(Chatbot, "generate_reply", side_effect=self._fake_reply),
+            mock.patch.object(Chatbot, "save_message"),
+            mock.patch.object(Chatbot, "record_model"),
+            mock.patch.object(Chatbot, "load_history", return_value=[]),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _fake_reply(self, session, context, user_input):
+        self.sent = list(context)
+        return Chatbot.Reply(text="4 jours.")
+
+    def test_documents_go_into_the_system_message_and_are_not_saved(self):
+        documents = {"role": "system", "content": "[loi.md]\n4 jours."}
+        with mock.patch.object(Chatbot, "rag_message", return_value=documents), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(Chatbot.chat_turn(self.session, "Congé mariage ?"))
+        # One system message (persona, then the excerpts), then the question: a second system
+        # message right before the question stopped small models from calling their tools.
+        self.assertEqual(self.sent, [{"role": "system", "content": "Tu es RH.\n\n[loi.md]\n4 jours."},
+                                     {"role": "user", "content": "Congé mariage ?"}])
+        saved = [call.args[2] for call in Chatbot.save_message.call_args_list]
+        self.assertEqual(saved, ["Congé mariage ?", "4 jours."])
+
+    def test_rag_gets_only_the_room_left_under_the_token_limit(self):
+        with mock.patch.object(Chatbot, "rag_message", return_value=None) as rag, \
+             mock.patch.object(Chatbot, "get_budget", return_value=100), \
+             contextlib.redirect_stdout(io.StringIO()):
+            Chatbot.chat_turn(self.session, "Question ?")
+        used = estimate_tokens("Tu es RH.") + estimate_tokens("Question ?")
+        rag.assert_called_once_with("Question ?", 100 - used, ollama_url="http://x", scope=None)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_documents_switched_off_skip_the_search_and_the_cache(self):
+        self.assertEqual(Commands.apply_setting(self.session, Commands.find_setting("documents"), "off"), ("off", None))
+        with mock.patch.object(Chatbot, "rag_message") as rag, mock.patch.object(Chatbot, "check_cache") as cache, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(Chatbot.chat_turn(self.session, "Congé mariage ?"))
+        rag.assert_not_called()
+        cache.assert_not_called()
+        self.assertEqual(self.sent, [{"role": "system", "content": "Tu es RH."}, {"role": "user", "content": "Congé mariage ?"}])
+        Chatbot.record_model.assert_called_once_with(1, "m")
+
+
+class ScopeCommandTests(unittest.TestCase):
+    def run_scope(self, session, text):
+        output = io.StringIO()
+        statuses = [{"source": "accord.pdf"}, {"source": "loi_teletravail.md"}]
+        with mock.patch.object(Commands, "document_statuses", return_value=statuses), contextlib.redirect_stdout(output):
+            Commands.handle_command(session, text)
+        return output.getvalue()
+
+    def test_scope_limits_the_search_to_documents_or_types_and_off_resets_it(self):
+        session = Commands.Session(user_id="u", conversation_id=1, model="m", persona_id="default", personas={},
+                                   ollama_url="x", search_motor="tavily")
+        self.assertIn("Searching in every HR document.", self.run_scope(session, "/scope"))
+        self.assertIn("Searching in loi_teletravail.md, every .pdf file.", self.run_scope(session, "/scope loi_teletravail.md pdf"))
+        self.assertEqual(session.document_scope, {"sources": ["loi_teletravail.md"], "types": ["pdf"]})
+        self.assertIn("unknown document: absent.md", self.run_scope(session, "/scope absent.md"))
+        self.assertEqual(session.document_scope, {"sources": ["loi_teletravail.md"], "types": ["pdf"]})
+        self.run_scope(session, "/scope off")
+        self.assertIsNone(session.document_scope)
+
+
+class IngestCommandTests(unittest.TestCase):
+    def setUp(self):
+        use_temporary_database(self)
+
+    def _run(self, text, stats, role=Commands.ROLE_HR):
+        session = Commands.Session(user_id="u", conversation_id=1, model="m", persona_id="default", personas={},
+                                   ollama_url="x", search_motor="tavily", account_role=role)
+        output = io.StringIO()
+        with mock.patch.object(Commands, "index_directory", return_value=stats) as index, \
+             contextlib.redirect_stdout(output):
+            Commands.handle_command(session, text)
+        return index, output.getvalue()
+
+    def test_default_folder_and_summary(self):
+        stats = {"indexed": 8, "unchanged": 0, "removed": 0, "chunks": 69, "failed": False}
+        index, output = self._run("/ingest", stats)
+        index.assert_called_once_with(Commands.DEFAULT_DOCS_DIR)
+        self.assertIn("8 document(s) indexed (69 chunks)", output)
+
+    def test_custom_folder_and_failure(self):
+        stats = {"indexed": 0, "unchanged": 0, "removed": 0, "chunks": 0, "failed": True}
+        with tempfile.TemporaryDirectory() as folder:
+            index, output = self._run(f"/ingest {folder}", stats)
+        index.assert_called_once_with(Path(folder))
+        self.assertIn("Indexing stopped", output)
+
+    def test_missing_folder_is_an_error_not_a_success(self):
+        index, output = self._run("/ingest /no/such/folder", None)
+        index.assert_not_called()
+        self.assertIn("is not a folder", output)
+
+    def test_an_employee_cannot_change_the_shared_base(self):
+        index, output = self._run("/ingest", None, role=Commands.ROLE_EMPLOYEE)
+        index.assert_not_called()
+        self.assertIn("only HR accounts", output)
+
+
+if __name__ == "__main__":
+    unittest.main()

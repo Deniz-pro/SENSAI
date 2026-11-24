@@ -1,0 +1,195 @@
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-3);
+  align-items: center;
+}
+
+.search {
+  width: 320px;
+  max-width: 100%;
+}
+
+.count {
+  margin-left: auto;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+.emptyCard {
+  padding: var(--spacing-8) var(--spacing-4);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xl);
+  background: var(--color-bg-surface);
+}
+
+.table {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xl);
+  background: var(--color-bg-surface);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(0, 2fr) 104px 148px;
+  gap: var(--spacing-4);
+  align-items: start;
+  min-height: 64px;
+  padding: var(--spacing-3) var(--spacing-4);
+  border-bottom: 1px solid var(--color-border-default);
+}
+
+.row:last-child {
+  border-bottom: 0;
+}
+
+.head {
+  align-items: center;
+  min-height: 40px;
+  padding-top: 0;
+  padding-bottom: 0;
+  background: var(--color-bg-surface-2);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  letter-spacing: 0.1px;
+}
+
+.cell {
+  min-width: 0;
+  padding-top: 7px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.request {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding-top: 7px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.type {
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.reason {
+  overflow-wrap: anywhere;
+}
+
+.employee {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+}
+
+.email {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+}
+
+.status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+  min-width: 0;
+}
+
+.status > span:first-child {
+  display: flex;
+  flex-direction: column;
+}
+
+.cardTop .status {
+  align-items: flex-end;
+}
+
+.row .employee {
+  padding-top: 6px;
+}
+
+.cancelled {
+  display: block;
+  padding-top: 5px;
+}
+
+.decidedBy {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.decision_approved button {
+  border-color: var(--color-success-default);
+  color: var(--color-success-default);
+}
+
+.decision_refused button {
+  border-color: var(--color-error-default);
+  color: var(--color-error-default);
+}
+
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: var(--spacing-3) var(--spacing-4);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  background: var(--color-bg-surface);
+}
+
+.cardTop {
+  display: flex;
+  gap: var(--spacing-3);
+  align-items: flex-start;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.cardLine,
+.cardReason {
+  margin: 0;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.cardReason {
+  color: var(--color-text-secondary);
+}
+
+@media (max-width: 767px) {
+  .search {
+    width: 100%;
+  }
+
+  .count {
+    margin-left: 0;
+  }
+}
